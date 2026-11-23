@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <utility>
 #include <functional>
+#include <limits>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -63,6 +64,8 @@ public:
             if (item.name_ == name) return item.quantity_;
         throw std::out_of_range("Supply not found in depot");
     }
+
+    const std::vector<ReliefCargo>& items() const { return stock_; }
 
     DistributionDepot& operator+=(const ReliefCargo& cargo) {
         for (auto& item : stock_) {
@@ -243,6 +246,11 @@ public:
     ReliefVehicle(double cap, std::size_t slots, std::string id)
         : TransportVehicle(slots), id_(std::move(id)), capacityKg_(cap) {}
     virtual void evaluateRoute() const = 0;
+    virtual std::string type() const = 0;
+    const std::string& destinationZone() const { return gps_.zone(); }
+    bool lifeSupportReady() const { return lifeSupport_.ready(); }
+    double capacityKg() const { return capacityKg_; }
+    double manifestWeight() const { return manifestWeightKg(); }
     virtual ~ReliefVehicle() = default;
     void setFuel(double f) { fuel_ = f; }
     void setDamagedCorridor(bool b) { damagedCorridor_ = b; }
@@ -254,30 +262,38 @@ class AerialTransport : virtual public ReliefVehicle {
 public:
     AerialTransport(double cap=500, std::size_t slots=4, std::string id="HELI-1")
         : ReliefVehicle(cap, slots, std::move(id)) {}
-    void evaluateRoute() const override { checkRoute(); std::cout << id() << ": air corridor selected\n"; }
+    void evaluateRoute() const override { checkRoute(); std::cout << id() << ": air corridor selected to " << destinationZone()
+                  << " | life support: " << (lifeSupportReady() ? "ready" : "not ready") << '\n'; }
+    std::string type() const override { return "Aerial transport"; }
     ~AerialTransport() override { std::cout << "Aerial transport deallocated\n"; }
 };
 class GroundConvoy : virtual public ReliefVehicle {
 public:
     GroundConvoy(double cap=2000, std::size_t slots=4, std::string id="TRUCK-1")
         : ReliefVehicle(cap, slots, std::move(id)) {}
-    void evaluateRoute() const override { checkRoute(); std::cout << id() << ": safest road route selected\n"; }
+    void evaluateRoute() const override { checkRoute(); std::cout << id() << ": safest road route selected to " << destinationZone()
+                  << " | life support: " << (lifeSupportReady() ? "ready" : "not ready") << '\n'; }
+    std::string type() const override { return "Ground convoy"; }
     ~GroundConvoy() override { std::cout << "Ground convoy deallocated\n"; }
 };
 class AmphibiousCraft : virtual public ReliefVehicle {
 public:
     AmphibiousCraft(double cap=3000, std::size_t slots=4, std::string id="BOAT-1")
         : ReliefVehicle(cap, slots, std::move(id)) {}
-    void evaluateRoute() const override { checkRoute(); std::cout << id() << ": water route selected\n"; }
+    void evaluateRoute() const override { checkRoute(); std::cout << id() << ": water route selected to " << destinationZone()
+                  << " | life support: " << (lifeSupportReady() ? "ready" : "not ready") << '\n'; }
+    std::string type() const override { return "Amphibious craft"; }
     ~AmphibiousCraft() override { std::cout << "Amphibious craft deallocated\n"; }
 };
 
 // Both parents virtually inherit ReliefVehicle, so the hybrid has one base instance.
 class HybridMedicalUnit : public GroundConvoy, public AmphibiousCraft {
 public:
-    HybridMedicalUnit()
-        : ReliefVehicle(2500, 4, "HYBRID-1"), GroundConvoy(), AmphibiousCraft() {}
-    void evaluateRoute() const override { checkRoute(); std::cout << id() << ": land/water medical route selected\n"; }
+    HybridMedicalUnit(double cap=2500, std::size_t slots=4, std::string id="HYBRID-1")
+        : ReliefVehicle(cap, slots, std::move(id)), GroundConvoy(), AmphibiousCraft() {}
+    void evaluateRoute() const override { checkRoute(); std::cout << id() << ": land/water medical route selected to " << destinationZone()
+                  << " | life support: " << (lifeSupportReady() ? "ready" : "not ready") << '\n'; }
+    std::string type() const override { return "Hybrid medical unit"; }
     ~HybridMedicalUnit() override { std::cout << "Hybrid medical unit deallocated\n"; }
 };
 
@@ -359,114 +375,355 @@ std::vector<std::string> loadAudit(const std::string& filename) {
 
 } // namespace ReliefOps::Logistics
 
+// Small input helpers keep the menu safe from invalid numeric input.
+int readInt(const std::string& prompt, int minValue, int maxValue) {
+    int value;
+    while (true) {
+        std::cout << prompt;
+        if (std::cin >> value && value >= minValue && value <= maxValue) return value;
+        std::cout << "Invalid input. Enter a value from " << minValue
+                  << " to " << maxValue << ".\n";
+        std::cin.clear();
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+}
+
+double readDouble(const std::string& prompt, double minValue, double maxValue) {
+    double value;
+    while (true) {
+        std::cout << prompt;
+        if (std::cin >> value && value >= minValue && value <= maxValue) return value;
+        std::cout << "Invalid input. Enter a value from " << minValue
+                  << " to " << maxValue << ".\n";
+        std::cin.clear();
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
+}
+
 int main() {
     using namespace ReliefOps::Inventory;
     using namespace ReliefOps::Logistics;
 
+    DistributionDepot depot;
+    depot += ReliefCargo("RationKit", 500, 1.0, 0.002);
+    depot += ReliefCargo("TraumaMedicine", 100, 0.2, 0.001);
+    depot += ReliefCargo("CleanWater", 50, 1000, 1.0);
+    depot += ReliefCargo("ThermalBlanket", 200, 0.8, 0.01);
+
+    // Base pointers demonstrate runtime polymorphism and virtual destruction.
+    std::vector<ReliefVehicle*> fleet;
+    std::vector<ReliefCargo> pendingCargo;
+    std::vector<std::string> audit;
+    std::vector<std::string> dispatchedIDs;
+    std::string auditFile = "relief_audit.bin";
+
     try {
-        DistributionDepot depot;
-        depot += ReliefCargo("RationKit", 500, 1.0, 0.002);
-        depot += ReliefCargo("TraumaMedicine", 100, 0.2, 0.001);
-        depot += ReliefCargo("CleanWater", 50, 1000, 1.0);
-        depot += ReliefCargo("ThermalBlanket", 200, 0.8, 0.01);
-
-        double freeVolume = 0.10;
-        ReliefCargo rationMission("RationKit", 100, 1.0, 0.002);
-        ReliefCargo& rations = allocate(depot, rationMission, freeVolume);
-
-        int patients = 12;
-        ReliefCargo medicalMission("TraumaMedicine", 0, 0.2, 0.001);
-        ReliefCargo& medicine = allocate(depot, medicalMission, patients, 10);
-
-        ReliefCargo emergency("TraumaMedicine", 0, 0.2, 0.001);
-        IncidentCommander::criticalTriageOverride(depot, emergency, 3);
-
-        depot += ReliefCargo("CleanWater", 5, 1000, 1.0); // restock using +=
-        depot -= ReliefCargo("CleanWater", 1, 1000, 1.0); // dispatch using -=
-
-        std::cout << "Rations allocated: " << rations.quantity() << '\n'
-                  << "Medicine allocated: " << medicine.quantity()
-                  << ", patients still waiting: " << patients << '\n'
-                  << "Emergency override units: " << emergency.quantity() << '\n';
-
-        std::vector<ReliefVehicle*> fleet;
-        fleet.push_back(new GroundConvoy(2000, 4, "TRUCK-01"));
-        fleet.push_back(new AerialTransport(500, 4, "HELI-01"));
-        fleet.push_back(new AmphibiousCraft(3000, 4, "BOAT-01"));
-        fleet.push_back(new HybridMedicalUnit());
-
-        fleet[0]->load(rations);
-        fleet[0]->load(medicine);
-        fleet[0]->load(ReliefCargo("RationKit", 2, 1.0, 0.002)); // duplicate item identity
-        fleet[0]->setDamagedCorridor(true);
-        fleet[1]->load(medicine);
-        fleet[1]->setFuel(0);
-        fleet[2]->load(ReliefCargo("CleanWater", 2, 1000, 1.0));
-        fleet[2]->setZone("Coastal Relief Zone");
-        fleet[3]->load(medicine);
-
-        fleet[0]->dispatch((payloadKg(rations) + payloadKg(medicine)) / 1000.0);
-        std::cout << "Duplicate cargo in truck manifest: "
-                  << (fleet[0]->hasDuplicateCargo() ? "yes" : "no") << '\n';
-
-        for (ReliefVehicle* vehicle : fleet) {
-            try { vehicle->evaluateRoute(); }
-            catch (const std::exception& e) { std::cout << vehicle->id() << ": " << e.what() << '\n'; }
-        }
-
-        {
-        // Deep-copy constructor and == manifest identity check.
-        GroundConvoy copiedTruck(*dynamic_cast<GroundConvoy*>(fleet[0]));
-        std::cout << "Copied manifest matches: " << (copiedTruck == *fleet[0]) << '\n';
-
-        // Demonstrate >> manifest restoration from the << serialized format.
-        std::stringstream serialized;
-        serialized << *fleet[0];
-        GroundConvoy restoredTruck(2000, 4, "RESTORED");
-        serialized >> restoredTruck;
-
-        std::cout << manifestTable;
-        for (std::size_t i = 0; i < restoredTruck.itemCount(); ++i) {
-            const auto& c = restoredTruck.item(i);
-            std::cout << std::left << std::setw(18) << c.name()
-                      << std::setw(10) << c.quantity() << c.unitWeight() << '\n';
-        }
-
-        std::vector<MedicalNeed> needs = {{"BurnKit", 5}, {"Blood", 10}, {"Oxygen", 8}};
-        std::sort(needs.begin(), needs.end(), UrgencyFirst{});
-        PriorityDispatchQueue<MedicalNeed> urgentQueue;
-        for (const auto& need : needs) urgentQueue.push(need);
-        std::cout << "Most urgent need: " << urgentQueue.top().item << '\n';
-
-        std::unordered_map<std::string, int> stockView;
-        stockView["RationKit"] = depot.stockCount("RationKit");
-        std::cout << "Ration stock remaining: " << stockView["RationKit"] << '\n';
-        std::cout << "Example distance: " << distanceKm(0, 0, 3, 4) << " km\n";
-
-        std::ostringstream manifestLog;
-        manifestLog << *fleet[0];
-        saveAudit("relief_audit.bin", {"Post-earthquake dispatch", manifestLog.str()});
-        std::cout << "Audit records restored: " << loadAudit("relief_audit.bin").size() << '\n';
-
-        // Demonstrate overweight exception.
-        AerialTransport overloaded(1, 2, "OVERLOAD-TEST");
-        overloaded.load(rations);
-        try { overloaded.evaluateRoute(); }
-        catch (const CargoOverweightException& e) { std::cout << e.what() << '\n'; }
-
-        }
-        std::cout << "Active vehicles before fleet cleanup: "
-                  << TransportVehicle::activeVehicles() << '\n'
-                  << "Dispatched tonnes: " << TransportVehicle::dispatchedTonnes() << '\n';
-
-        // Delete through base pointers: virtual destructors run correctly.
-        for (ReliefVehicle* vehicle : fleet) delete vehicle;
-        std::cout << "Active vehicles after fleet cleanup: "
-                  << TransportVehicle::activeVehicles() << '\n';
+        audit = loadAudit(auditFile);
+        std::cout << "Loaded " << audit.size() << " previous audit record(s).\n";
+    } catch (const std::exception& e) {
+        std::cout << "Could not read old audit file: " << e.what() << "\n";
     }
-    catch (const std::exception& e) {
-        std::cerr << "Relief hub error: " << e.what() << '\n';
-        return 1;
-    }
+
+    auto saveRecord = [&](const std::string& record) {
+        audit.push_back(record);
+        try {
+            saveAudit(auditFile, audit);
+            std::cout << "Audit record saved.\n";
+        } catch (const std::exception& e) {
+            std::cout << "Audit save failed: " << e.what() << "\n";
+        }
+    };
+
+    auto showInventory = [&]() {
+        std::unordered_map<std::string, int> stock;
+        for (const auto& item : depot.items()) stock[item.name()] = item.quantity();
+        std::cout << "\n--- AVAILABLE INVENTORY ---\n";
+        std::cout << std::left << std::setw(20) << "SUPPLY" << std::setw(12)
+                  << "QUANTITY" << std::setw(14) << "KG/UNIT" << "M3/UNIT\n";
+        for (const auto& item : depot.items()) {
+            std::cout << std::left << std::setw(20) << item.name()
+                      << std::setw(12) << stock[item.name()]
+                      << std::setw(14) << item.unitWeight()
+                      << item.unitVolume() << '\n';
+        }
+    };
+
+    auto chooseSupply = [&]() -> const ReliefCargo* {
+        if (depot.items().empty()) {
+            std::cout << "No supplies in the depot.\n";
+            return nullptr;
+        }
+        std::cout << "\nSelect supply:\n";
+        for (std::size_t i = 0; i < depot.items().size(); ++i)
+            std::cout << i + 1 << ". " << depot.items()[i].name()
+                      << " (stock: " << depot.items()[i].quantity() << ")\n";
+        int choice = readInt("Choice: ", 1, static_cast<int>(depot.items().size()));
+        return &depot.items()[choice - 1];
+    };
+
+    auto chooseVehicle = [&]() -> ReliefVehicle* {
+        if (fleet.empty()) {
+            std::cout << "No vehicles registered. Register a vehicle first.\n";
+            return nullptr;
+        }
+        std::cout << "\nSelect vehicle:\n";
+        for (std::size_t i = 0; i < fleet.size(); ++i)
+            std::cout << i + 1 << ". " << fleet[i]->id() << " - "
+                      << fleet[i]->type() << "\n";
+        int choice = readInt("Choice: ", 1, static_cast<int>(fleet.size()));
+        return fleet[choice - 1];
+    };
+
+    int choice;
+    do {
+        std::cout << "\n========== ERL-HUB =========="
+                  << "\n1. View inventory"
+                  << "\n2. Restock supplies"
+                  << "\n3. Allocate relief supplies"
+                  << "\n4. Emergency triage override"
+                  << "\n5. Register transport vehicle"
+                  << "\n6. View fleet and manifests"
+                  << "\n7. Load allocated cargo"
+                  << "\n8. Dispatch vehicle"
+                  << "\n9. Manage urgent medical needs"
+                  << "\n10. View audit logs"
+                  << "\n11. View logistics statistics"
+                  << "\n0. Exit\n";
+        choice = readInt("Enter your choice: ", 0, 11);
+
+        try {
+            switch (choice) {
+            case 1:
+                showInventory();
+                break;
+
+            case 2: {
+                ReliefCargo cargo;
+                std::cout << "Enter: SupplyName Quantity UnitWeightKg UnitVolumeM3\n";
+                std::cout << "Example: RationKit 100 1.0 0.002\n> ";
+                if (std::cin >> cargo && cargo.quantity() >= 0 &&
+                    cargo.unitWeight() >= 0 && cargo.unitVolume() >= 0) {
+                    depot += cargo; // overloaded += restocks the depot
+                    saveRecord("RESTOCK: " + cargo.name() + " x" +
+                               std::to_string(cargo.quantity()));
+                } else {
+                    std::cout << "Invalid cargo details.\n";
+                    std::cin.clear();
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                }
+                break;
+            }
+
+            case 3: {
+                const ReliefCargo* supply = chooseSupply();
+                if (!supply) break;
+                int method = readInt("1. Volume-based allocation  2. Medical-priority allocation: ", 1, 2);
+                ReliefCargo mission(supply->name(), 0, supply->unitWeight(), supply->unitVolume());
+                if (method == 1) {
+                    int requested = readInt("Units requested: ", 1, 1000000);
+                    double freeVolume = readDouble("Available vehicle volume (m3): ", 0.000001, 1000000);
+                    mission.setQuantity(requested);
+                    ReliefCargo& allocated = allocate(depot, mission, freeVolume);
+                    std::cout << "Allocated " << allocated.quantity()
+                              << " unit(s). Remaining free volume: " << freeVolume << " m3\n";
+                } else {
+                    int patients = readInt("Patients requiring treatment: ", 1, 1000000);
+                    int priority = readInt("Priority (1-10): ", 1, 10);
+                    ReliefCargo& allocated = allocate(depot, mission, patients, priority);
+                    std::cout << "Allocated " << allocated.quantity()
+                              << " unit(s). Patients still waiting: " << patients << '\n';
+                }
+                if (mission.quantity() > 0) {
+                    pendingCargo.push_back(mission);
+                    saveRecord("ALLOCATED: " + mission.name() + " x" +
+                               std::to_string(mission.quantity()));
+                    std::cout << "Cargo added to pending manifest list.\n";
+                } else {
+                    std::cout << "No cargo was allocated.\n";
+                }
+                break;
+            }
+
+            case 4: {
+                const ReliefCargo* supply = chooseSupply();
+                if (!supply) break;
+                int units = readInt("Emergency units requested: ", 1, 1000000);
+                ReliefCargo emergency(supply->name(), 0, supply->unitWeight(), supply->unitVolume());
+                IncidentCommander::criticalTriageOverride(depot, emergency, units);
+                std::cout << "Commander override allocated " << emergency.quantity()
+                          << " unit(s).\n";
+                if (emergency.quantity() > 0) {
+                    pendingCargo.push_back(emergency);
+                    saveRecord("TRIAGE OVERRIDE: " + emergency.name() + " x" +
+                               std::to_string(emergency.quantity()));
+                }
+                break;
+            }
+
+            case 5: {
+                int type = readInt("1. Ground truck  2. Aerial vehicle (helicopter/drone)  3. Amphibious boat  4. Hybrid medical unit: ", 1, 4);
+                std::string id;
+                std::cout << "Vehicle ID (no spaces): ";
+                std::cin >> id;
+                double capacity = readDouble("Payload capacity (kg): ", 1, 1000000);
+                int slots = readInt("Manifest item slots: ", 1, 100);
+                ReliefVehicle* vehicle = nullptr;
+                if (type == 1) vehicle = new GroundConvoy(capacity, slots, id);
+                if (type == 2) vehicle = new AerialTransport(capacity, slots, id);
+                if (type == 3) vehicle = new AmphibiousCraft(capacity, slots, id);
+                if (type == 4) vehicle = new HybridMedicalUnit(capacity, slots, id);
+                fleet.push_back(vehicle);
+                std::cout << vehicle->type() << " registered successfully.\n";
+                saveRecord("VEHICLE REGISTERED: " + id + " (" + vehicle->type() + ")");
+                break;
+            }
+
+            case 6: {
+                if (fleet.empty()) {
+                    std::cout << "No vehicles registered.\n";
+                    break;
+                }
+                for (ReliefVehicle* vehicle : fleet) {
+                    std::cout << "\n" << vehicle->id() << " - " << vehicle->type()
+                              << " | Load: " << vehicle->manifestWeight()
+                              << " / " << vehicle->capacityKg() << " kg\n";
+                    // Copy constructor, ==, << and >> are demonstrated here.
+                    TransportVehicle copied(*vehicle);
+                    std::stringstream serialized;
+                    serialized << copied;
+                    TransportVehicle restored(vehicle->itemCount());
+                    serialized >> restored;
+                    std::cout << "Copied manifest matches: "
+                              << (copied == *vehicle ? "yes" : "no") << '\n';
+                    std::cout << manifestTable;
+                    for (std::size_t i = 0; i < restored.itemCount(); ++i) {
+                        const ReliefCargo& cargo = restored.item(i);
+                        std::cout << std::left << std::setw(18) << cargo.name()
+                                  << std::setw(10) << cargo.quantity()
+                                  << cargo.unitWeight() << '\n';
+                    }
+                    std::cout << "Duplicate cargo identity: "
+                              << (vehicle->hasDuplicateCargo() ? "yes" : "no") << '\n';
+                }
+                break;
+            }
+
+            case 7: {
+                if (pendingCargo.empty()) {
+                    std::cout << "No allocated cargo is waiting to be loaded.\n";
+                    break;
+                }
+                std::cout << "\nPending cargo:\n";
+                for (std::size_t i = 0; i < pendingCargo.size(); ++i)
+                    std::cout << i + 1 << ". " << pendingCargo[i].name()
+                              << " x" << pendingCargo[i].quantity() << '\n';
+                int cargoChoice = readInt("Select cargo: ", 1, static_cast<int>(pendingCargo.size()));
+                ReliefVehicle* vehicle = chooseVehicle();
+                if (!vehicle) break;
+                ReliefCargo cargo = pendingCargo[cargoChoice - 1];
+                if (vehicle->load(cargo)) {
+                    pendingCargo.erase(pendingCargo.begin() + cargoChoice - 1);
+                    std::cout << cargo.name() << " loaded into " << vehicle->id() << ".\n";
+                    saveRecord("LOADED: " + cargo.name() + " into " + vehicle->id());
+                } else {
+                    std::cout << "Vehicle manifest is full.\n";
+                }
+                break;
+            }
+
+            case 8: {
+                ReliefVehicle* vehicle = chooseVehicle();
+                if (!vehicle) break;
+                if (vehicle->itemCount() == 0) {
+                    std::cout << "Cannot dispatch an empty vehicle.\n";
+                    break;
+                }
+                if (std::find(dispatchedIDs.begin(), dispatchedIDs.end(), vehicle->id()) != dispatchedIDs.end()) {
+                    std::cout << "This vehicle has already been dispatched.\n";
+                    break;
+                }
+                double fuel = readDouble("Fuel level (0-100): ", 0, 100);
+                int damaged = readInt("Is the planned corridor damaged? (1=yes, 0=no): ", 0, 1);
+                std::string zone;
+                std::cout << "Destination zone (one word): ";
+                std::cin >> zone;
+                vehicle->setFuel(fuel);
+                vehicle->setDamagedCorridor(damaged == 1);
+                vehicle->setZone(zone);
+                double x = readDouble("Destination map X coordinate: ", -100000, 100000);
+                double y = readDouble("Destination map Y coordinate: ", -100000, 100000);
+                std::cout << "Approx. route distance: " << distanceKm(0, 0, x, y) << " km\n";
+                try {
+                    vehicle->evaluateRoute();
+                    double tonnes = vehicle->manifestWeight() / 1000.0;
+                    vehicle->dispatch(tonnes);
+                    dispatchedIDs.push_back(vehicle->id());
+                    std::ostringstream record;
+                    record << "DISPATCHED: " << vehicle->id() << " to " << zone
+                           << ", " << tonnes << " metric tonnes";
+                    saveRecord(record.str());
+                    std::cout << "Dispatch successful.\n";
+                } catch (const CargoOverweightException& e) {
+                    std::cout << "Dispatch blocked: " << e.what() << '\n';
+                } catch (const FuelDepletionException& e) {
+                    std::cout << "Dispatch blocked: " << e.what() << '\n';
+                } catch (const DamagedCorridorException& e) {
+                    std::cout << "Dispatch blocked: " << e.what() << '\n';
+                }
+                break;
+            }
+
+            case 9: {
+                int count = readInt("Number of urgent medical needs: ", 1, 50);
+                std::vector<MedicalNeed> needs;
+                PriorityDispatchQueue<MedicalNeed, UrgencyFirst> urgentQueue;
+                for (int i = 0; i < count; ++i) {
+                    MedicalNeed need;
+                    std::cout << "Need name (no spaces): ";
+                    std::cin >> need.item;
+                    need.priority = readInt("Priority (1-10): ", 1, 10);
+                    needs.push_back(need);
+                    urgentQueue.push(need);
+                }
+                std::sort(needs.begin(), needs.end(), UrgencyFirst{});
+                std::cout << "\nNeeds sorted by urgency:\n";
+                for (const auto& need : needs)
+                    std::cout << need.item << " - priority " << need.priority << '\n';
+                if (!urgentQueue.empty())
+                    std::cout << "Next priority dispatch: " << urgentQueue.top().item << '\n';
+                break;
+            }
+
+            case 10:
+                std::cout << "\n--- AUDIT LOGS ---\n";
+                if (audit.empty()) std::cout << "No audit records available.\n";
+                for (std::size_t i = 0; i < audit.size(); ++i)
+                    std::cout << i + 1 << ". " << audit[i] << '\n';
+                break;
+
+            case 11:
+                std::cout << "\n--- LOGISTICS STATISTICS ---\n"
+                          << "Registered vehicles: " << fleet.size() << '\n'
+                          << "Currently allocated vehicle objects: "
+                          << TransportVehicle::activeVehicles() << '\n'
+                          << "Successfully dispatched: " << dispatchedIDs.size() << '\n'
+                          << "Total dispatched payload: "
+                          << TransportVehicle::dispatchedTonnes() << " metric tonnes\n"
+                          << "Pending cargo batches: " << pendingCargo.size() << '\n';
+                break;
+
+            case 0:
+                std::cout << "Exiting ERL-HUB...\n";
+                break;
+            }
+        } catch (const std::exception& e) {
+            std::cout << "Operation failed: " << e.what() << '\n';
+        }
+    } while (choice != 0);
+
+    // Delete through base pointers; virtual destructors call derived destructors.
+    for (ReliefVehicle* vehicle : fleet) delete vehicle;
+    std::cout << "All vehicles deallocated. Active count: "
+              << TransportVehicle::activeVehicles() << '\n';
     return 0;
 }
